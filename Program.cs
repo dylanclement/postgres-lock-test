@@ -13,6 +13,7 @@ namespace postgres_lock_test
         public int numRuns;
         public int numOrgs;
         public int maxDelayMS;
+        public CountdownEvent countdownEvent;
     };
 
     // Class to represent the MTD Service endpoint, throws an error when called with the same refresh token twice in a row
@@ -22,7 +23,7 @@ namespace postgres_lock_test
 
         // NB! Mimics HMRC refresh Service call
         // - Throws exception when trying to use a refresh token that's already been used
-        public static void RefreshToken(int orgId, string token)
+        public static bool RefreshToken(int orgId, string token)
         {
             // locking to ensure only one thread can call this at a time
             lock (refreshTokens)
@@ -30,10 +31,14 @@ namespace postgres_lock_test
                 if (refreshTokens.ContainsKey(orgId) && refreshTokens[orgId] == token)
                 {
                     // Already refreshed :(
-                    throw new Exception("Token already refreshed!");
+                    //Console.Write("Refresh token already used!");
+                    return false;
                 }
 
                 refreshTokens[orgId] = token;
+
+                // Returns 
+                return true;
             }
         }
     }
@@ -42,7 +47,8 @@ namespace postgres_lock_test
     {   
         private static Random random = new Random();
 
-        public static void SendMessage1(int orgId, int maxDelayMS)
+        // No locking used for refresh tokens
+        public static void SendMessage1(int orgId, int maxDelayMS, ref int failCount)
         {
             using (var conn = new NpgsqlConnection("User ID=dylan.clement;Host=localhost;Port=5432;Database=postgres;Pooling=true;"))
             {
@@ -51,15 +57,48 @@ namespace postgres_lock_test
                 var tran = conn.BeginTransaction();
 
                 // Get refresh token from DB
-                var id = conn.QueryFirst<string>($"SELECT RefreshToken FROM public.TestRefreshTokenLock WHERE orgId = {orgId};");
+                var token = conn.QueryFirstOrDefault<string>($@"SELECT ""RefreshToken"" FROM ""TestRefreshTokenLock"" WHERE ""OrgId"" = {orgId};");
 
                 // Get new token and sleep for some RNG
                 var newToken  = random.Next().ToString();
                 Thread.Sleep(random.Next(1, maxDelayMS));
 
                 // Update refresh token in DB
-                HMRSService.RefreshToken(orgId, newToken);
-                conn.Execute($"UPDATE public.TestRefreshTokenLock SET RefreshToken = {newToken} WHERE orgId = {orgId};");
+                if (HMRSService.RefreshToken(orgId, newToken) == false) {
+                    // Tried to re-use refresh token
+                    Interlocked.Increment(ref failCount);
+
+                }
+                conn.Execute($@"UPDATE ""TestRefreshTokenLock"" SET ""RefreshToken"" = '{newToken}' WHERE ""OrgId"" = {orgId};");
+
+                // Commit transaction, release SQL locks
+                tran.Commit();
+            }
+        }
+
+        
+        // Using update locks used for refresh tokens
+        public static void SendMessage2(int orgId, int maxDelayMS, ref int failCount)
+        {
+            using (var conn = new NpgsqlConnection("User ID=dylan.clement;Host=localhost;Port=5432;Database=postgres;Pooling=true;"))
+            {
+                conn.Open();
+
+                var tran = conn.BeginTransaction();
+
+                // Get refresh token from DB
+                var token = conn.QueryFirstOrDefault<string>($@"SELECT ""RefreshToken"" FROM ""TestRefreshTokenLock"" WHERE ""OrgId"" = {orgId} FOR UPDATE;");
+
+                // Get new token and sleep for some RNG
+                var newToken  = random.Next().ToString();
+                Thread.Sleep(random.Next(1, maxDelayMS));
+
+                // Update refresh token in DB
+                if (HMRSService.RefreshToken(orgId, newToken) == false) {
+                    // Tried to re-use refresh token
+                    Interlocked.Increment(ref failCount);
+                }
+                conn.Execute($@"UPDATE ""TestRefreshTokenLock"" SET ""RefreshToken"" = '{newToken}' WHERE ""OrgId"" = {orgId};");
 
                 // Commit transaction, release SQL locks
                 tran.Commit();
@@ -70,11 +109,10 @@ namespace postgres_lock_test
     class Program
     {
         public const int NUM_RUNS = 1000;
-        public const int NUM_THREADS = 4;
-
-        public const int NUM_ORGS = 10;
-        public const int MAX_DELAY_IN_MS = 100;
-
+        public const int NUM_THREADS = 32;
+        public const int NUM_ORGS = 5;
+        public const int MAX_DELAY_IN_MS = 10;
+        private static int failCount = 0;
         private static Random random = new Random();
     
         static void ThreadRun(object stateInfo)
@@ -82,17 +120,28 @@ namespace postgres_lock_test
             var data = (ThreadData)stateInfo;
             for (var i = 0; i < data.numRuns; i++)
             {
-                MTDService.SendMessage1(random.Next(0, data.numOrgs), data.maxDelayMS);
-            } 
+                // Change send message function here
+                MTDService.SendMessage1(random.Next(0, data.numOrgs), data.maxDelayMS, ref failCount);
+            }
+
+            // Signal event
+            data.countdownEvent.Signal();
         }
 
         static void Main(string[] args)
         {
-            for (int i = 0; i < NUM_THREADS; i++)
+            // create countdown event to wait fo threads to exit
+            using (var countdownEvent = new CountdownEvent(NUM_THREADS))
             {
-                ThreadPool.QueueUserWorkItem(ThreadRun, new ThreadData { numOrgs = NUM_ORGS, numRuns = NUM_RUNS / NUM_THREADS, maxDelayMS = MAX_DELAY_IN_MS});
-            }
-            Console.WriteLine($"Successfully ran for {NUM_RUNS} iterations");       
+                for (int i = 0; i < NUM_THREADS; i++)
+                {
+                    ThreadPool.QueueUserWorkItem(ThreadRun, new ThreadData { numOrgs = NUM_ORGS, numRuns = NUM_RUNS / NUM_THREADS, maxDelayMS = MAX_DELAY_IN_MS, countdownEvent = countdownEvent});
+                }
+
+                // Wait for all threads to complete
+                countdownEvent.Wait();
+                Console.WriteLine($"Successfully ran for {NUM_RUNS} iterations with {failCount} errors." );   
+            }    
         }
     }
 }
